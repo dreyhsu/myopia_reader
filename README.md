@@ -39,7 +39,7 @@ A PDF ebook reader application that displays text in a dark theme with large fon
 **Purpose**: Render text with optimal reading experience
 **Key Functions**:
 - Dark theme styling (dark background, light text)
-- Large, readable font rendering
+- Large, readable font rendering for myopia without glasses
 - Text flow and pagination
 - Smooth scrolling and navigation
 - Responsive layout for different screen sizes

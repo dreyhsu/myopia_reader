@@ -5,8 +5,9 @@ Extracts text content from PDF files with error handling and structure preservat
 
 import os
 import logging
+import re
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import PyPDF2
 import pdfplumber
 import fitz  # PyMuPDF
@@ -80,7 +81,6 @@ class PDFProcessor:
                     try:
                         page_text = page.extract_text()
                         if page_text:
-                            text += f"\n--- Page {page_num + 1} ---\n"
                             text += page_text
                     except Exception as e:
                         self.logger.warning(f"Error extracting page {page_num + 1}: {str(e)}")
@@ -109,7 +109,6 @@ class PDFProcessor:
                     try:
                         page_text = page.extract_text()
                         if page_text:
-                            text += f"\n--- Page {page_num + 1} ---\n"
                             text += page_text
                     except Exception as e:
                         self.logger.warning(f"Error extracting page {page_num + 1}: {str(e)}")
@@ -140,7 +139,6 @@ class PDFProcessor:
                     page = pdf_document[page_num]
                     page_text = page.get_text()
                     if page_text:
-                        text += f"\n--- Page {page_num + 1} ---\n"
                         text += page_text
                 except Exception as e:
                     self.logger.warning(f"Error extracting page {page_num + 1}: {str(e)}")
@@ -280,6 +278,133 @@ class PDFProcessor:
         
         return cleaned_text
     
+    def detect_chapters(self, text: str) -> List[Tuple[str, int, str]]:
+        """
+        Detect chapters in the text based on CHAPTER markers.
+        
+        Args:
+            text: Full extracted text
+            
+        Returns:
+            List of tuples: (chapter_name, start_position, chapter_content)
+        """
+        if not text:
+            return []
+        
+        # Pattern to match exactly "CHAPTER" followed by space and number (entire line)
+        chapter_pattern = r'^CHAPTER\s+(\d+)$'
+        
+        chapters = []
+        lines = text.split('\n')
+        chapter_starts = []
+        
+        # First pass: find all chapter start positions
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            chapter_match = re.match(chapter_pattern, line_stripped)
+            
+            if chapter_match:
+                chapter_num = int(chapter_match.group(1))
+                chapter_starts.append((i, chapter_num, f"Chapter {chapter_num}"))
+        
+        # Second pass: extract content between chapters
+        if chapter_starts:
+            # Add introduction content (everything before first chapter)
+            if chapter_starts[0][0] > 0:
+                intro_content = '\n'.join(lines[:chapter_starts[0][0]]).strip()
+                if intro_content:
+                    chapters.append(("Introduction", -1, intro_content))
+            
+            # Extract each chapter content
+            for i, (start_line, chapter_num, chapter_name) in enumerate(chapter_starts):
+                # Determine end line for this chapter
+                if i + 1 < len(chapter_starts):
+                    end_line = chapter_starts[i + 1][0]  # Start of next chapter
+                else:
+                    end_line = len(lines)  # End of document
+                
+                # Extract chapter content (including the chapter header)
+                chapter_content = '\n'.join(lines[start_line:end_line]).strip()
+                
+                if chapter_content:
+                    chapters.append((chapter_name, chapter_num - 1, chapter_content))
+        else:
+            # No chapters found, treat all as introduction
+            intro_text = text.strip()
+            if intro_text:
+                chapters.append(("Introduction", -1, intro_text))
+        
+        return chapters
+    
+    def create_chapter_folders(self, base_output_dir: str, pdf_name: str) -> Dict[str, str]:
+        """
+        Create organized folder structure for PDF chapters.
+        
+        Args:
+            base_output_dir: Base output directory
+            pdf_name: Name of the PDF file (without extension)
+            
+        Returns:
+            Dict mapping folder types to paths
+        """
+        # Create main PDF folder
+        pdf_folder = Path(base_output_dir) / pdf_name
+        pdf_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Create subfolders
+        folders = {
+            "main": str(pdf_folder),
+            "intro": str(pdf_folder / "intro"),
+        }
+        
+        # Create intro folder
+        Path(folders["intro"]).mkdir(exist_ok=True)
+        
+        return folders
+    
+    def save_chapter_files(self, chapters: List[Tuple[str, int, str]], folders: Dict[str, str], pdf_name: str) -> List[str]:
+        """
+        Save each chapter to its respective folder.
+        
+        Args:
+            chapters: List of chapter tuples (name, index, content)
+            folders: Dictionary of folder paths
+            pdf_name: Name of the PDF file
+            
+        Returns:
+            List of saved file paths
+        """
+        saved_files = []
+        
+        for chapter_name, chapter_index, content in chapters:
+            try:
+                if chapter_index == -1:  # Introduction
+                    folder_path = folders["intro"]
+                    filename = "introduction.txt"
+                else:
+                    # Create numbered folder for chapter (01, 02, etc.)
+                    chapter_folder_name = f"{chapter_index + 1:02d}"
+                    chapter_folder_path = Path(folders["main"]) / chapter_folder_name
+                    chapter_folder_path.mkdir(exist_ok=True)
+                    
+                    folder_path = str(chapter_folder_path)
+                    # Clean chapter name for filename
+                    clean_name = re.sub(r'[^\w\s-]', '', chapter_name).strip()
+                    clean_name = re.sub(r'\s+', '_', clean_name).lower()
+                    filename = f"{clean_name}.txt"
+                
+                file_path = Path(folder_path) / filename
+                
+                # Save chapter content
+                if self.save_to_file(content, str(file_path)):
+                    saved_files.append(str(file_path))
+                    self.logger.info(f"Saved {chapter_name} to: {file_path}")
+                    
+            except Exception as e:
+                self.logger.error(f"Failed to save {chapter_name}: {str(e)}")
+        
+        return saved_files
+    
     def save_to_file(self, text: str, output_path: str, encoding: str = 'utf-8') -> bool:
         """
         Save extracted text to a file.
@@ -307,26 +432,29 @@ class PDFProcessor:
             self.logger.error(f"Failed to save text to {output_path}: {str(e)}")
             return False
     
-    def process_pdf(self, file_path: str, clean_text: bool = True, save_to_output: bool = False, output_dir: str = "output") -> Dict[str, Any]:
+    def process_pdf(self, file_path: str, clean_text: bool = True, save_to_output: bool = False, output_dir: str = "output", split_chapters: bool = True) -> Dict[str, Any]:
         """
-        Complete PDF processing: extract text, metadata, and clean text.
+        Complete PDF processing: extract text, metadata, clean text, and organize by chapters.
         
         Args:
             file_path: Path to the PDF file
             clean_text: Whether to clean the extracted text
             save_to_output: Whether to save extracted text to output folder
             output_dir: Directory to save output files (default: "output")
+            split_chapters: Whether to split content by chapters (default: True)
             
         Returns:
-            dict: Processing results containing text, metadata, and status
+            dict: Processing results containing text, metadata, chapters, and status
         """
         result = {
             "success": False,
             "file_path": file_path,
             "text": None,
             "metadata": {},
+            "chapters": [],
+            "saved_files": [],
             "error": None,
-            "output_file": None
+            "output_folder": None
         }
         
         try:
@@ -341,14 +469,40 @@ class PDFProcessor:
                 result["success"] = True
                 self.logger.info(f"Successfully processed PDF: {file_path}")
                 
-                # Save to output file if requested
+                # Process chapters and save to organized folders
                 if save_to_output and result["text"]:
                     pdf_name = Path(file_path).stem
-                    output_filename = f"{pdf_name}_extracted.txt"
-                    output_path = Path(output_dir) / output_filename
                     
-                    if self.save_to_file(result["text"], str(output_path)):
-                        result["output_file"] = str(output_path)
+                    if split_chapters:
+                        # Detect and split chapters
+                        chapters = self.detect_chapters(result["text"])
+                        result["chapters"] = [(name, idx, len(content)) for name, idx, content in chapters]
+                        
+                        if chapters:
+                            # Create organized folder structure
+                            folders = self.create_chapter_folders(output_dir, pdf_name)
+                            result["output_folder"] = folders["main"]
+                            
+                            # Save chapters to respective folders
+                            saved_files = self.save_chapter_files(chapters, folders, pdf_name)
+                            result["saved_files"] = saved_files
+                            
+                            self.logger.info(f"Split into {len(chapters)} chapters and saved to: {folders['main']}")
+                        else:
+                            # No chapters detected, save as single file in organized structure
+                            folders = self.create_chapter_folders(output_dir, pdf_name)
+                            result["output_folder"] = folders["main"]
+                            
+                            output_path = Path(folders["intro"]) / "full_text.txt"
+                            if self.save_to_file(result["text"], str(output_path)):
+                                result["saved_files"] = [str(output_path)]
+                    else:
+                        # Save as single file in simple structure
+                        output_filename = f"{pdf_name}_extracted.txt"
+                        output_path = Path(output_dir) / output_filename
+                        
+                        if self.save_to_file(result["text"], str(output_path)):
+                            result["saved_files"] = [str(output_path)]
                     
             else:
                 result["error"] = "Text extraction failed"
@@ -366,11 +520,11 @@ def main():
     processor = PDFProcessor()
     
     # Example: Process a PDF file and save to output folder
-    pdf_path = r"C:\Users\Drey\Documents\Python_Scripts\myopia_reader\pdf\Trade+Your+Way+to+Financial+Freedom+by+Van+Tharp.pdf"
+    pdf_path = r"C:\Users\Drey\Documents\Python_Scripts\myopia_reader\pdf\TradeYourWaytoFinancialFreedom.pdf"
     
     if os.path.exists(pdf_path):
-        print("Processing PDF file...")
-        result = processor.process_pdf(pdf_path, save_to_output=True)
+        print("Processing PDF file with chapter detection...")
+        result = processor.process_pdf(pdf_path, save_to_output=True, split_chapters=True)
         
         if result["success"]:
             print(f"✓ Successfully processed: {pdf_path}")
@@ -378,8 +532,18 @@ def main():
             print(f"  File size: {result['metadata']['file_size']} bytes")
             print(f"  Text length: {len(result['text'])} characters")
             
-            if result["output_file"]:
-                print(f"  Saved to: {result['output_file']}")
+            if result["chapters"]:
+                print(f"  Chapters detected: {len(result['chapters'])}")
+                for chapter_name, chapter_idx, content_length in result["chapters"]:
+                    print(f"    - {chapter_name}: {content_length} characters")
+            
+            if result["output_folder"]:
+                print(f"  Organized output saved to: {result['output_folder']}")
+            
+            if result["saved_files"]:
+                print(f"  Files created: {len(result['saved_files'])}")
+                for file_path in result["saved_files"]:
+                    print(f"    - {file_path}")
             
             # Show first 500 characters
             print("\nFirst 500 characters:")
